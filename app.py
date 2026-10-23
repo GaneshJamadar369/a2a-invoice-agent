@@ -707,6 +707,7 @@ async def send_message(request: Request) -> Response:
             )
         return make_response({"task": task}, 200)
     except RuntimeError as exc:
+        print(f"invoice_model_error: {exc}", flush=True)
         clear_pending(principal, message_id, digest)
         reason = str(exc)
         status = 503 if reason == "AI_NOT_CONFIGURED" else 502
