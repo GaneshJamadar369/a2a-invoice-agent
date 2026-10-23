@@ -27,6 +27,8 @@ from fastapi.responses import JSONResponse, Response
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("a2a.invoice")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 APP_VERSION = "1.0.0"
 A2A_PREFIX = "/a2a"
@@ -408,6 +410,19 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
 async def call_gemini(
     batch_data: dict[str, Any], packages: list[dict[str, Any]], key: str
 ) -> dict[str, dict[str, Any]]:
+    # Gemini can take too long on the full 12-package payload. Keep each request
+    # small and run the chunks concurrently; the caller still receives one
+    # complete decision map for the task.
+    if len(packages) > 4:
+        chunks = [packages[i:i + 4] for i in range(0, len(packages), 4)]
+        logger.info("gemini_chunking packages=%d chunks=%d chunk_size<=4", len(packages), len(chunks))
+        results = await asyncio.gather(*(call_gemini(batch_data, chunk, key) for chunk in chunks))
+        merged: dict[str, dict[str, Any]] = {}
+        for result in results:
+            merged.update(result)
+        if len(merged) != len(packages):
+            raise ValueError("MODEL_DECISION_COUNT_MISMATCH")
+        return merged
     model = os.getenv("GEMINI_MODEL", GEMINI_MODEL).strip()
     prompt_data = dict(batch_data)
     prompt_data["packages"] = packages
