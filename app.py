@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -23,6 +24,9 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("a2a.invoice")
 
 APP_VERSION = "1.0.0"
 A2A_PREFIX = "/a2a"
@@ -343,6 +347,7 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
     # handles the grader's full batch without Groq's request-size limit. Use it
     # when configured and leave the existing OpenAI-compatible path unchanged.
     gemini_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip()
+    logger.info("provider_select packages=%d input_chars=%d gemini_configured=%s groq_configured=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(gemini_key), bool(os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
     if gemini_key and not os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip():
         return await call_gemini(batch_data, packages, gemini_key)
     key = os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()
@@ -369,15 +374,19 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
     }
     timeout = httpx.Timeout(44.0, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        started = time.monotonic()
         response = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
         )
+    logger.info("groq_response status=%s elapsed_ms=%d response_bytes=%d", response.status_code, int((time.monotonic()-started)*1000), len(response.content))
     if response.status_code >= 400:
+        logger.error("groq_error status=%s body=%s", response.status_code, response.text[:500])
         raise RuntimeError(f"UPSTREAM_MODEL_ERROR_{response.status_code}")
     response_data = response.json()
     content = response_data["choices"][0]["message"]["content"]
+    logger.info("groq_parse content_chars=%d", len(content or ""))
     parsed = json.loads(content)
     raw_decisions = parsed.get("decisions")
     if not isinstance(raw_decisions, list) or len(raw_decisions) != len(packages):
@@ -446,12 +455,17 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
     }
     timeout = httpx.Timeout(44.0, connect=8.0)
     url = f"{os.getenv('GEMINI_URL', GEMINI_URL).rstrip('/')}/{model}:generateContent"
+    logger.info("gemini_request model=%s packages=%d prompt_chars=%d url=%s", model, len(packages), len(prompt), url)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        started = time.monotonic()
         response = await client.post(url, params={"key": key}, json=payload)
+    logger.info("gemini_response status=%s elapsed_ms=%d response_bytes=%d", response.status_code, int((time.monotonic()-started)*1000), len(response.content))
     if response.status_code >= 400:
+        logger.error("gemini_error status=%s body=%s", response.status_code, response.text[:1000])
         raise RuntimeError(f"UPSTREAM_MODEL_ERROR_{response.status_code}")
     response_data = response.json()
     content = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    logger.info("gemini_parse content_chars=%d", len(content))
     if content.startswith("```"):
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE).strip()
     parsed = json.loads(content)
@@ -479,6 +493,7 @@ async def decide_packages(batch_data: dict[str, Any]) -> dict[str, dict[str, Any
     ids = [p.get("packageId") if isinstance(p, dict) else None for p in packages]
     if any(not isinstance(pid, str) or not pid for pid in ids) or len(set(ids)) != len(ids):
         raise ValueError("PACKAGE_IDS_MUST_BE_UNIQUE")
+    logger.info("decision_start batch_id=%s packages=%d policy=%s", batch_data.get("batchId"), len(packages), batch_data.get("policyRevision"))
     decisions_by_package_id: dict[str, dict[str, Any]] = {}
     misses: list[dict[str, Any]] = []
     key_by_id: dict[str, str] = {}
@@ -491,6 +506,7 @@ async def decide_packages(batch_data: dict[str, Any]) -> dict[str, dict[str, Any
         else:
             misses.append(package)
     if misses:
+        logger.info("decision_cache hits=%d misses=%d", len(packages)-len(misses), len(misses))
         model_decisions = await call_groq(batch_data, misses)
         new_cache: list[tuple[str, dict[str, Any]]] = []
         for package in misses:
@@ -617,6 +633,7 @@ async def send_message(request: Request) -> Response:
         return parse_error
     assert principal is not None and message is not None
     message_id = message["messageId"]
+    logger.info("message_received id=%s principal=%s parts=%d body_bytes=%d", message_id, principal[:12], len(message.get("parts", [])), len(await request.body()))
     digest = sha256_text(canonical_json(message))  # only message, never configuration
     reserve_state, payload, status_code = await get_or_reserve(principal, message_id, digest)
     if reserve_state == "conflict":
@@ -655,6 +672,7 @@ async def send_message(request: Request) -> Response:
             save_idempotency_error(principal, message_id, digest, body, 400)
             return make_response(body, 400)
         batch_id = batch_data.get("batchId")
+        logger.info("batch_received message_id=%s batch_id=%s packages=%d", message_id, batch_id, len(batch_data.get("packages", [])) if isinstance(batch_data.get("packages"), list) else -1)
         if not isinstance(batch_id, str) or not batch_id:
             body = {"error": "BATCH_ID_REQUIRED"}
             save_idempotency_error(principal, message_id, digest, body, 400)
@@ -705,9 +723,10 @@ async def send_message(request: Request) -> Response:
                 "UPDATE idempotency SET state='DONE',task_id=?,result_json=?,status_code=200,updated_at=? WHERE principal=? AND message_id=? AND message_hash=?",
                 (task_id, serialized, now, principal, message_id, digest),
             )
+        logger.info("task_created task_id=%s context_id=%s batch_id=%s proposals=%d", task_id, context_id, batch_id, len(proposals))
         return make_response({"task": task}, 200)
     except RuntimeError as exc:
-        print(f"invoice_model_error: {exc}", flush=True)
+        logger.exception("invoice_model_error message_id=%s error=%s", message_id, exc)
         clear_pending(principal, message_id, digest)
         reason = str(exc)
         status = 503 if reason == "AI_NOT_CONFIGURED" else 502
@@ -715,10 +734,11 @@ async def send_message(request: Request) -> Response:
     except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         # Keep the client error generic, but leave the validation cause in Render
         # logs so model/provider formatting issues can be repaired without guessing.
-        print(f"invoice_validation_error: {type(exc).__name__}: {exc}", flush=True)
+        logger.exception("invoice_validation_error message_id=%s error=%s", message_id, exc)
         clear_pending(principal, message_id, digest)
         return error("INVOICE_BATCH_COULD_NOT_BE_VALIDATED", 422)
     except Exception:
+        logger.exception("invoice_internal_error message_id=%s", message_id)
         clear_pending(principal, message_id, digest)
         return error("INTERNAL_ERROR", 500)
 
