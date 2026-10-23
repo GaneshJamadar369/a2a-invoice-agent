@@ -367,7 +367,7 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
             {"role": "user", "content": json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":"))},
         ],
     }
-    timeout = httpx.Timeout(38.0, connect=8.0)
+    timeout = httpx.Timeout(44.0, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             GROQ_URL,
@@ -413,9 +413,38 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
             "temperature": 0,
             "maxOutputTokens": 8000,
             "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "decisions": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "packageId": {"type": "STRING"},
+                                "action": {"type": "STRING", "enum": sorted(ACTIONS)},
+                                "facts": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "vendorName": {"type": "STRING"},
+                                        "invoiceNumber": {"type": "STRING"},
+                                        "amountMinor": {"type": "INTEGER"},
+                                        "currency": {"type": "STRING"},
+                                    },
+                                    "required": ["vendorName", "invoiceNumber", "amountMinor", "currency"],
+                                },
+                                "evidenceRefs": {"type": "ARRAY", "items": {"type": "STRING"}},
+                                "rationale": {"type": "STRING"},
+                            },
+                            "required": ["packageId", "action", "facts", "evidenceRefs", "rationale"],
+                        },
+                    }
+                },
+                "required": ["decisions"],
+            },
         },
     }
-    timeout = httpx.Timeout(38.0, connect=8.0)
+    timeout = httpx.Timeout(44.0, connect=8.0)
     url = f"{os.getenv('GEMINI_URL', GEMINI_URL).rstrip('/')}/{model}:generateContent"
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, params={"key": key}, json=payload)
