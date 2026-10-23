@@ -682,7 +682,10 @@ async def send_message(request: Request) -> Response:
         reason = str(exc)
         status = 503 if reason == "AI_NOT_CONFIGURED" else 502
         return error(reason if reason == "AI_NOT_CONFIGURED" else "INVOICE_DECISION_SERVICE_UNAVAILABLE", status)
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        # Keep the client error generic, but leave the validation cause in Render
+        # logs so model/provider formatting issues can be repaired without guessing.
+        print(f"invoice_validation_error: {type(exc).__name__}: {exc}", flush=True)
         clear_pending(principal, message_id, digest)
         return error("INVOICE_BATCH_COULD_NOT_BE_VALIDATED", 422)
     except Exception:
