@@ -359,8 +359,9 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
     logger.info("provider_select packages=%d input_chars=%d nvidia_configured=%s gemini_configured=%s groq_configured=%s nvidia_model=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(nvidia_key), bool(gemini_key), bool(groq_key), os.getenv("NVIDIA_MODEL", NVIDIA_MODEL), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
     if nvidia_key:
         if len(packages) > 4:
-            chunks = [packages[i:i + 4] for i in range(0, len(packages), 4)]
-            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size<=4", len(packages), len(chunks))
+            chunk_size = max(1, int(os.getenv("NVIDIA_CHUNK_SIZE", "2")))
+            chunks = [packages[i:i + chunk_size] for i in range(0, len(packages), chunk_size)]
+            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d", len(packages), len(chunks), chunk_size)
             results = await asyncio.gather(*(call_groq(batch_data, chunk) for chunk in chunks))
             merged: dict[str, dict[str, Any]] = {}
             for result in results:
