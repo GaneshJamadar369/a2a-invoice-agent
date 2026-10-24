@@ -460,6 +460,14 @@ def _fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _fallback_decisions(packages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    decisions: dict[str, dict[str, Any]] = {}
+    for package in packages:
+        decision = _fallback_decision(package)
+        decisions[package["packageId"]] = decision
+    return decisions
+
+
 async def call_groq(
     batch_data: dict[str, Any],
     packages: list[dict[str, Any]],
@@ -515,7 +523,15 @@ async def call_groq(
                         logger.exception("nvidia_chunk_failed index=%d packages=%d first_package=%s", index, len(chunk), chunk[0].get("packageId"))
                         raise
 
-            results = await asyncio.gather(*(run_chunk(index, chunk) for index, chunk in enumerate(chunks)))
+            try:
+                results = await asyncio.gather(*(run_chunk(index, chunk) for index, chunk in enumerate(chunks)))
+            except Exception as exc:
+                # Keep the A2A contract available through a provider-wide
+                # transient failure.  Individual chunk recovery normally
+                # handles this; this final guard covers cancellation, a
+                # malformed provider response, or an unexpected SDK error.
+                logger.exception("nvidia_batch_recovery reason=%s packages=%d", type(exc).__name__, len(packages))
+                return _fallback_decisions(packages)
             merged: dict[str, dict[str, Any]] = {}
             for result in results:
                 merged.update(result)
@@ -766,13 +782,25 @@ async def decide_packages(batch_data: dict[str, Any]) -> dict[str, dict[str, Any
             misses.append(package)
     if misses:
         logger.info("decision_cache hits=%d misses=%d", len(packages)-len(misses), len(misses))
-        model_decisions = await call_groq(batch_data, misses)
+        fallback_used = False
+        try:
+            model_decisions = await call_groq(batch_data, misses)
+        except Exception as exc:
+            # A provider outage must not turn a valid A2A invoice batch into a
+            # 5xx/422.  The local path is deliberately conservative and still
+            # requires the source's exact evidence IDs during normalization.
+            if os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY).strip():
+                logger.exception("decision_fallback reason=%s packages=%d", type(exc).__name__, len(misses))
+                model_decisions = _fallback_decisions(misses)
+                fallback_used = True
+            else:
+                raise
         new_cache: list[tuple[str, dict[str, Any]]] = []
         for package in misses:
             raw = model_decisions[package["packageId"]]
             normalized = normalize_decision(package, raw)
             decisions_by_package_id[package["packageId"]] = normalized
-            log_decision(package, normalized, source="model")
+            log_decision(package, normalized, source="fallback" if fallback_used else "model")
             new_cache.append((key_by_id[package["packageId"]], normalized))
         for key, decision in new_cache:
             cache_put(key, decision)
