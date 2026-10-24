@@ -361,8 +361,22 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
         if len(packages) > 4:
             chunk_size = max(1, int(os.getenv("NVIDIA_CHUNK_SIZE", "2")))
             chunks = [packages[i:i + chunk_size] for i in range(0, len(packages), chunk_size)]
-            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d", len(packages), len(chunks), chunk_size)
-            results = await asyncio.gather(*(call_groq(batch_data, chunk) for chunk in chunks))
+            concurrency = max(1, int(os.getenv("NVIDIA_CONCURRENCY", "4")))
+            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d concurrency=%d", len(packages), len(chunks), chunk_size, concurrency)
+            limiter = asyncio.Semaphore(concurrency)
+
+            async def run_chunk(index: int, chunk: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+                async with limiter:
+                    logger.info("nvidia_chunk_start index=%d packages=%d first_package=%s", index, len(chunk), chunk[0].get("packageId"))
+                    try:
+                        result = await call_groq(batch_data, chunk)
+                        logger.info("nvidia_chunk_complete index=%d packages=%d", index, len(chunk))
+                        return result
+                    except Exception:
+                        logger.exception("nvidia_chunk_failed index=%d packages=%d first_package=%s", index, len(chunk), chunk[0].get("packageId"))
+                        raise
+
+            results = await asyncio.gather(*(run_chunk(index, chunk) for index, chunk in enumerate(chunks)))
             merged: dict[str, dict[str, Any]] = {}
             for result in results:
                 merged.update(result)
