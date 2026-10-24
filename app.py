@@ -795,10 +795,25 @@ async def decide_packages(batch_data: dict[str, Any]) -> dict[str, dict[str, Any
                 fallback_used = True
             else:
                 raise
+        try:
+            normalized_misses = [
+                (package, normalize_decision(package, model_decisions[package["packageId"]]))
+                for package in misses
+            ]
+        except (ValueError, KeyError, TypeError) as exc:
+            if not os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY).strip() or fallback_used:
+                raise
+            # A model can return JSON with the wrong facts even when the
+            # provider request itself succeeded. Treat that as a model failure
+            # and run the same evidence-checked local recovery path.
+            logger.exception("decision_validation_fallback reason=%s packages=%d", type(exc).__name__, len(misses))
+            normalized_misses = [
+                (package, normalize_decision(package, _fallback_decision(package)))
+                for package in misses
+            ]
+            fallback_used = True
         new_cache: list[tuple[str, dict[str, Any]]] = []
-        for package in misses:
-            raw = model_decisions[package["packageId"]]
-            normalized = normalize_decision(package, raw)
+        for package, normalized in normalized_misses:
             decisions_by_package_id[package["packageId"]] = normalized
             log_decision(package, normalized, source="fallback" if fallback_used else "model")
             new_cache.append((key_by_id[package["packageId"]], normalized))
