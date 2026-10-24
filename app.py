@@ -420,7 +420,34 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
     response_data = response.json()
     content = response_data["choices"][0]["message"]["content"]
     logger.info("%s_parse content_chars=%d", provider_name, len(content or ""))
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        if provider_name != "nvidia":
+            raise
+        # Nemotron can occasionally emit a near-JSON answer despite the strict
+        # prompt. Retry the same chunk with an explicit repair instruction.
+        logger.warning("nvidia_json_retry reason=invalid_json content_prefix=%s", (content or "")[:300])
+        repair_payload = dict(payload)
+        repair_payload["max_tokens"] = 6000
+        repair_payload["messages"] = list(payload["messages"]) + [{
+            "role": "user",
+            "content": "The previous answer was invalid JSON. Return ONLY one compact, syntactically valid JSON object with the exact decisions schema. Do not include reasoning, markdown, commentary, or unescaped quotation marks inside strings.",
+        }]
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            retry_started = time.monotonic()
+            retry_response = await client.post(
+                provider_url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=repair_payload,
+            )
+        logger.info("nvidia_json_retry_response status=%s elapsed_ms=%d response_bytes=%d", retry_response.status_code, int((time.monotonic()-retry_started)*1000), len(retry_response.content))
+        if retry_response.status_code >= 400:
+            logger.error("nvidia_json_retry_error status=%s body=%s", retry_response.status_code, retry_response.text[:1000])
+            raise RuntimeError(f"UPSTREAM_MODEL_ERROR_{retry_response.status_code}")
+        retry_content = retry_response.json()["choices"][0]["message"]["content"]
+        logger.info("nvidia_json_retry_parse content_chars=%d", len(retry_content or ""))
+        parsed = json.loads(retry_content)
     raw_decisions = parsed.get("decisions")
     if not isinstance(raw_decisions, list) or len(raw_decisions) != len(packages):
         raise ValueError("MODEL_DECISION_COUNT_MISMATCH")
