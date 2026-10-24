@@ -45,7 +45,9 @@ ACTIONS = {
     "open_exception",
 }
 MAX_BODY_BYTES = 512 * 1024
-IDEMPOTENCY_WAIT_SECONDS = 40
+# Model-backed batches can take longer than a normal request, and the grader
+# intentionally replays some message IDs while the first request is running.
+IDEMPOTENCY_WAIT_SECONDS = 90
 
 DB_PATH = os.getenv("DATABASE_PATH", "./data/a2a-invoice-agent.sqlite3")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -376,7 +378,10 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
     logger.info("provider_select packages=%d input_chars=%d nvidia_configured=%s gemini_configured=%s groq_configured=%s nvidia_model=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(nvidia_key), bool(gemini_key), bool(groq_key), os.getenv("NVIDIA_MODEL", NVIDIA_MODEL), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
     if nvidia_key:
         if len(packages) > 4:
-            chunk_size = max(1, int(os.getenv("NVIDIA_CHUNK_SIZE", "2")))
+            # Long grader packages vary greatly in generation time. One package
+            # per request prevents a slow invoice from holding a two-package
+            # request past the provider timeout.
+            chunk_size = max(1, int(os.getenv("NVIDIA_CHUNK_SIZE", "1")))
             chunks = [packages[i:i + chunk_size] for i in range(0, len(packages), chunk_size)]
             concurrency = max(1, int(os.getenv("NVIDIA_CONCURRENCY", "4")))
             logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d concurrency=%d", len(packages), len(chunks), chunk_size, concurrency)
@@ -423,10 +428,11 @@ Use this action precedence: (1) material conflict between current records requir
 Choose exactly three evidence IDs from the controlling paragraph that determines the action. Copy each bracketed ID exactly, including capitalization, punctuation, and brackets. Do not choose an ID merely because it appears somewhere in the package, in an archive example, or on a cover sheet. Before returning, re-check that the action follows the controlling facts, all three IDs support that action, and the rationale explains the link between the action and at least two of those IDs.
 For every package, choose one action from: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"...", "facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},"evidenceRefs":["[ref1]","[ref2]","[ref3]"],"rationale":"60 to 1500 characters"}]}. facts.amountMinor is the amount in the currency's minor unit (e.g. paise for INR, cents for USD). Keep the exact invoice facts from the source. evidenceRefs must contain exactly the three decisive bracketed references from the paragraph that determines the action; use the source's exact spelling including brackets. Do not use the cover-sheet reference, archive examples, or decoys. The rationale must name the selected action and cite at least two of those references. Do not add fields or markdown."""
+    nvidia_max_tokens = max(2000, int(os.getenv("NVIDIA_MAX_TOKENS", "6000")))
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 8000,
+        "max_tokens": nvidia_max_tokens if provider_name == "nvidia" else 8000,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":"))},
@@ -438,14 +444,33 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     else:
         payload["response_format"] = {"type": "json_object"}
-    timeout = httpx.Timeout(44.0, connect=8.0)
+    timeout_seconds = 35.0 if provider_name == "nvidia" else 44.0
+    timeout = httpx.Timeout(timeout_seconds, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         started = time.monotonic()
-        response = await client.post(
-            provider_url,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-        )
+        try:
+            response = await client.post(
+                provider_url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        except httpx.TimeoutException:
+            if provider_name != "nvidia":
+                raise
+            logger.warning("nvidia_request_retry reason=timeout packages=%d timeout_seconds=%s", len(packages), timeout_seconds)
+            retry_payload = dict(payload)
+            retry_payload["max_tokens"] = max(2000, nvidia_max_tokens // 2)
+            retry_payload["messages"] = list(payload["messages"]) + [{
+                "role": "user",
+                "content": "Return the exact compact JSON schema now. Keep each rationale concise (60 to 300 characters) and include only the three decisive evidence IDs.",
+            }]
+            retry_started = time.monotonic()
+            response = await client.post(
+                provider_url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=retry_payload,
+            )
+            logger.info("nvidia_request_retry_response status=%s elapsed_ms=%d response_bytes=%d", response.status_code, int((time.monotonic()-retry_started)*1000), len(response.content))
     logger.info("%s_response status=%s elapsed_ms=%d response_bytes=%d", provider_name, response.status_code, int((time.monotonic()-started)*1000), len(response.content))
     if response.status_code >= 400:
         logger.error("%s_error status=%s body=%s", provider_name, response.status_code, response.text[:1000])
@@ -462,7 +487,7 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
         # prompt. Retry the same chunk with an explicit repair instruction.
         logger.warning("nvidia_json_retry reason=invalid_json content_prefix=%s", (content or "")[:300])
         repair_payload = dict(payload)
-        repair_payload["max_tokens"] = 6000
+        repair_payload["max_tokens"] = max(2000, nvidia_max_tokens // 2)
         repair_payload["messages"] = list(payload["messages"]) + [{
             "role": "user",
             "content": "The previous answer was invalid JSON. Return ONLY one compact, syntactically valid JSON object with the exact decisions schema. Do not include reasoning, markdown, commentary, or unescaped quotation marks inside strings.",
