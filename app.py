@@ -58,6 +58,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_URL = os.getenv(
     "GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models"
 )
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+NVIDIA_URL = os.getenv(
+    "NVIDIA_URL", "https://integrate.api.nvidia.com/v1/chat/completions"
+)
 
 
 def utc_now() -> str:
@@ -349,13 +354,23 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
     # handles the grader's full batch without Groq's request-size limit. Use it
     # when configured and leave the existing OpenAI-compatible path unchanged.
     gemini_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip()
-    logger.info("provider_select packages=%d input_chars=%d gemini_configured=%s groq_configured=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(gemini_key), bool(os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
-    if gemini_key and not os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip():
+    nvidia_key = os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY).strip()
+    groq_key = os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()
+    logger.info("provider_select packages=%d input_chars=%d nvidia_configured=%s gemini_configured=%s groq_configured=%s nvidia_model=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(nvidia_key), bool(gemini_key), bool(groq_key), os.getenv("NVIDIA_MODEL", NVIDIA_MODEL), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
+    if nvidia_key:
+        key = nvidia_key
+        model = os.getenv("NVIDIA_MODEL", NVIDIA_MODEL)
+        provider_url = os.getenv("NVIDIA_URL", NVIDIA_URL)
+        provider_name = "nvidia"
+    elif gemini_key and not groq_key:
         return await call_gemini(batch_data, packages, gemini_key)
-    key = os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()
+    else:
+        key = groq_key
+        model = os.getenv("GROQ_MODEL", GROQ_MODEL)
+        provider_url = GROQ_URL
+        provider_name = "groq"
     if not key:
         raise RuntimeError("AI_NOT_CONFIGURED")
-    model = os.getenv("GROQ_MODEL", GROQ_MODEL)
     prompt_data = dict(batch_data)
     # Keep all policy/context fields from the supplied batch, while sending only packages
     # whose content has not already been decided and cached.
@@ -367,28 +382,33 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
     payload = {
         "model": model,
         "temperature": 0,
-        "max_completion_tokens": 8000,
-        "response_format": {"type": "json_object"},
+        "max_tokens": 8000,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":"))},
         ],
     }
+    if provider_name == "nvidia":
+        # NVIDIA NIM accepts this control at the top level. Keep reasoning off so
+        # the response budget is spent on the required JSON decisions.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        payload["response_format"] = {"type": "json_object"}
     timeout = httpx.Timeout(44.0, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         started = time.monotonic()
         response = await client.post(
-            GROQ_URL,
+            provider_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
         )
-    logger.info("groq_response status=%s elapsed_ms=%d response_bytes=%d", response.status_code, int((time.monotonic()-started)*1000), len(response.content))
+    logger.info("%s_response status=%s elapsed_ms=%d response_bytes=%d", provider_name, response.status_code, int((time.monotonic()-started)*1000), len(response.content))
     if response.status_code >= 400:
-        logger.error("groq_error status=%s body=%s", response.status_code, response.text[:500])
+        logger.error("%s_error status=%s body=%s", provider_name, response.status_code, response.text[:1000])
         raise RuntimeError(f"UPSTREAM_MODEL_ERROR_{response.status_code}")
     response_data = response.json()
     content = response_data["choices"][0]["message"]["content"]
-    logger.info("groq_parse content_chars=%d", len(content or ""))
+    logger.info("%s_parse content_chars=%d", provider_name, len(content or ""))
     parsed = json.loads(content)
     raw_decisions = parsed.get("decisions")
     if not isinstance(raw_decisions, list) or len(raw_decisions) != len(packages):

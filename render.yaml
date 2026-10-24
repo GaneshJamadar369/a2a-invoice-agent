@@ -17,3 +17,9 @@ services:
         value: openai/gpt-oss-120b
       - key: DATABASE_PATH
         value: ./data/a2a-invoice-agent.sqlite3
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b
+      - key: NVIDIA_URL
+        value: https://integrate.api.nvidia.com/v1/chat/completions
