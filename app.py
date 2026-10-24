@@ -358,6 +358,16 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
     groq_key = os.getenv("GROQ_API_KEY", GROQ_API_KEY).strip()
     logger.info("provider_select packages=%d input_chars=%d nvidia_configured=%s gemini_configured=%s groq_configured=%s nvidia_model=%s gemini_model=%s groq_model=%s", len(packages), len(canonical_json(packages)), bool(nvidia_key), bool(gemini_key), bool(groq_key), os.getenv("NVIDIA_MODEL", NVIDIA_MODEL), os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.getenv("GROQ_MODEL", GROQ_MODEL))
     if nvidia_key:
+        if len(packages) > 4:
+            chunks = [packages[i:i + 4] for i in range(0, len(packages), 4)]
+            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size<=4", len(packages), len(chunks))
+            results = await asyncio.gather(*(call_groq(batch_data, chunk) for chunk in chunks))
+            merged: dict[str, dict[str, Any]] = {}
+            for result in results:
+                merged.update(result)
+            if len(merged) != len(packages):
+                raise ValueError("MODEL_DECISION_COUNT_MISMATCH")
+            return merged
         key = nvidia_key
         model = os.getenv("NVIDIA_MODEL", NVIDIA_MODEL)
         provider_url = os.getenv("NVIDIA_URL", NVIDIA_URL)
