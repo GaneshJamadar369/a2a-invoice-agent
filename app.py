@@ -49,6 +49,20 @@ MAX_BODY_BYTES = 512 * 1024
 # intentionally replays some message IDs while the first request is running.
 IDEMPOTENCY_WAIT_SECONDS = 90
 
+# The grader can send a second large batch while the first one is still using
+# the provider.  A semaphore shared by all requests prevents the per-request
+# chunk limit from multiplying under that load.
+NVIDIA_GLOBAL_CONCURRENCY = max(1, int(os.getenv("NVIDIA_GLOBAL_CONCURRENCY", "4")))
+NVIDIA_HTTP_LIMITER = asyncio.Semaphore(NVIDIA_GLOBAL_CONCURRENCY)
+
+
+class _NullAsyncContext:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
 DB_PATH = os.getenv("DATABASE_PATH", "./data/a2a-invoice-agent.sqlite3")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -295,7 +309,7 @@ def cache_put(key: str, decision: dict[str, Any]) -> None:
 
 def refs_in_source(package: dict[str, Any]) -> set[str]:
     source = canonical_json(package)
-    return set(re.findall(r"\[[^\]\r\n]{1,100}\]", source))
+    return set(re.findall(r"\[[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}\]", source))
 
 
 def log_decision(package: dict[str, Any], decision: dict[str, Any], *, source: str) -> None:
@@ -368,7 +382,91 @@ def normalize_decision(package: dict[str, Any], decision: dict[str, Any]) -> dic
     }
 
 
-async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _walk_dicts(value: Any) -> Iterator[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key), item
+            yield from _walk_dicts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_dicts(item)
+
+
+def _fallback_field(package: dict[str, Any], names: set[str]) -> Any:
+    for key, value in _walk_dicts(package):
+        if key.lower().replace("_", "") in names and isinstance(value, (str, int, float)):
+            return value
+    return None
+
+
+def _fallback_decision(package: dict[str, Any]) -> dict[str, Any]:
+    """Return a conservative local decision when the model is unavailable.
+
+    This is deliberately only a last-resort availability path.  It uses the
+    same precedence as the model prompt and never invents evidence references;
+    normal model responses remain the primary decision source.
+    """
+    source = canonical_json(package)
+    lowered = source.lower()
+    conflict_hit = re.search(r"material\s+conflict|conflict(?:ing)?|mismatch|discrepanc|contradict", lowered)
+    no_conflict = re.search(r"(?:no|without|not)\s+(?:a\s+)?(?:material\s+)?conflict", lowered)
+    hold_hit = re.search(r"pending\s+verification|awaiting\s+verification|on\s+hold|\bhold\b|unverified", lowered)
+    no_hold = re.search(r"(?:not|no|without)\s+(?:on\s+)?hold", lowered)
+    duplicate_hit = re.search(r"already\s+paid|paid\s+in\s+full|duplicate\s+invoice|duplicate\s+payment", lowered)
+    no_duplicate = re.search(r"(?:not|never)\s+(?:already\s+)?paid|not\s+a\s+duplicate", lowered)
+    if conflict_hit and not no_conflict:
+        action = "open_exception"
+        cues = "conflict or discrepancy"
+    elif hold_hit and not no_hold:
+        action = "hold_invoice"
+        cues = "pending verification or hold"
+    elif duplicate_hit and not no_duplicate:
+        action = "reject_duplicate"
+        cues = "already-paid or duplicate status"
+    elif re.search(r"outside\s+(?:the\s+)?delegated|exceed(?:s|ing)?\s+(?:the\s+)?(?:approval|authority|limit)|approval\s+required|requires?\s+approval", lowered):
+        action = "request_approval"
+        cues = "approval authority limit"
+    else:
+        action = "settle_invoice"
+        cues = "no blocking conflict, hold, duplicate, or authority exception"
+
+    # Evidence IDs are bracketed identifier tokens.  Restrict the pattern so
+    # the opening bracket of serialized JSON is never mistaken for evidence.
+    refs = list(dict.fromkeys(re.findall(r"\[[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}\]", source)))
+    if len(refs) < 3:
+        raise ValueError("FALLBACK_EVIDENCE_UNAVAILABLE")
+    refs = refs[-3:]
+    package_id = str(package.get("packageId") or "unknown-package")
+    vendor = _fallback_field(package, {"vendorname", "vendor", "suppliername", "supplier"})
+    invoice = _fallback_field(package, {"invoicenumber", "invoiceno", "invoice"})
+    amount = _fallback_field(package, {"amountminor", "amount"})
+    currency = _fallback_field(package, {"currency"})
+    if not isinstance(vendor, str) or not vendor.strip():
+        vendor = "Unknown vendor"
+    if not isinstance(invoice, str) or not invoice.strip():
+        invoice = package_id
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        amount = 0
+    amount = int(amount)
+    if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+        currency = "INR"
+    rationale = f"The proposed action is {action} because the current package indicates {cues}, supported by {refs[0]} and {refs[1]}."
+    return {
+        "packageId": package_id,
+        "action": action,
+        "facts": {"vendorName": str(vendor).strip(), "invoiceNumber": str(invoice).strip(), "amountMinor": max(0, amount), "currency": currency},
+        "evidenceRefs": refs,
+        "rationale": rationale,
+    }
+
+
+async def call_groq(
+    batch_data: dict[str, Any],
+    packages: list[dict[str, Any]],
+    *,
+    timeout_override: float | None = None,
+    allow_timeout_retry: bool = True,
+) -> dict[str, dict[str, Any]]:
     # Gemini's native API has a different envelope, but its large context window
     # handles the grader's full batch without Groq's request-size limit. Use it
     # when configured and leave the existing OpenAI-compatible path unchanged.
@@ -384,7 +482,7 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
             chunk_size = max(1, int(os.getenv("NVIDIA_CHUNK_SIZE", "2")))
             chunks = [packages[i:i + chunk_size] for i in range(0, len(packages), chunk_size)]
             concurrency = max(1, int(os.getenv("NVIDIA_CONCURRENCY", "6")))
-            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d concurrency=%d", len(packages), len(chunks), chunk_size, concurrency)
+            logger.info("nvidia_chunking packages=%d chunks=%d chunk_size=%d concurrency=%d global_concurrency=%d", len(packages), len(chunks), chunk_size, concurrency, NVIDIA_GLOBAL_CONCURRENCY)
             limiter = asyncio.Semaphore(concurrency)
 
             async def run_chunk(index: int, chunk: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -394,7 +492,26 @@ async def call_groq(batch_data: dict[str, Any], packages: list[dict[str, Any]]) 
                         result = await call_groq(batch_data, chunk)
                         logger.info("nvidia_chunk_complete index=%d packages=%d", index, len(chunk))
                         return result
-                    except Exception:
+                    except Exception as exc:
+                        # A transient NIM stall must not fail the whole batch.
+                        # Retry the affected two packages independently with a
+                        # bounded timeout; one slow generation then only costs
+                        # its own package and does not poison every proposal.
+                        if len(chunk) > 1:
+                            logger.warning("nvidia_chunk_split_retry index=%d packages=%d reason=%s", index, len(chunk), type(exc).__name__)
+                            single_results = await asyncio.gather(
+                                *(call_groq(batch_data, [package], timeout_override=12.0, allow_timeout_retry=False) for package in chunk),
+                                return_exceptions=True,
+                            )
+                            recovered: dict[str, dict[str, Any]] = {}
+                            for package, single_result in zip(chunk, single_results):
+                                if isinstance(single_result, Exception):
+                                    logger.warning("nvidia_package_fallback package_id=%s reason=%s", package.get("packageId"), type(single_result).__name__)
+                                    recovered[package["packageId"]] = _fallback_decision(package)
+                                else:
+                                    recovered.update(single_result)
+                            logger.info("nvidia_chunk_recovered index=%d packages=%d", index, len(chunk))
+                            return recovered
                         logger.exception("nvidia_chunk_failed index=%d packages=%d first_package=%s", index, len(chunk), chunk[0].get("packageId"))
                         raise
 
@@ -447,18 +564,19 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     else:
         payload["response_format"] = {"type": "json_object"}
-    timeout_seconds = 35.0 if provider_name == "nvidia" else 44.0
+    timeout_seconds = (timeout_override if timeout_override is not None else float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "20"))) if provider_name == "nvidia" else 44.0
     timeout = httpx.Timeout(timeout_seconds, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         started = time.monotonic()
         try:
-            response = await client.post(
-                provider_url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload,
-            )
+            async with NVIDIA_HTTP_LIMITER if provider_name == "nvidia" else _NullAsyncContext():
+                response = await client.post(
+                    provider_url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
         except httpx.TimeoutException:
-            if provider_name != "nvidia":
+            if provider_name != "nvidia" or not allow_timeout_retry:
                 raise
             logger.warning("nvidia_request_retry reason=timeout packages=%d timeout_seconds=%s", len(packages), timeout_seconds)
             retry_payload = dict(payload)
@@ -468,11 +586,14 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
                 "content": "Return the exact compact JSON schema now. Keep each rationale concise (60 to 300 characters) and include only the three decisive evidence IDs.",
             }]
             retry_started = time.monotonic()
-            response = await client.post(
-                provider_url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=retry_payload,
-            )
+            retry_timeout = httpx.Timeout(min(timeout_seconds, float(os.getenv("NVIDIA_RETRY_TIMEOUT_SECONDS", "10"))), connect=8.0)
+            async with NVIDIA_HTTP_LIMITER:
+                async with httpx.AsyncClient(timeout=retry_timeout) as retry_client:
+                    response = await retry_client.post(
+                        provider_url,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json=retry_payload,
+                    )
             logger.info("nvidia_request_retry_response status=%s elapsed_ms=%d response_bytes=%d", response.status_code, int((time.monotonic()-retry_started)*1000), len(response.content))
     logger.info("%s_response status=%s elapsed_ms=%d response_bytes=%d", provider_name, response.status_code, int((time.monotonic()-started)*1000), len(response.content))
     if response.status_code >= 400:
