@@ -567,7 +567,9 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
     # Two decisions plus compact rationales fit comfortably in this budget;
     # keeping it bounded is important because NIM latency rises with the
     # requested generation ceiling even when the answer is shorter.
-    nvidia_max_tokens = max(2000, int(os.getenv("NVIDIA_MAX_TOKENS", "3000")))
+    # The required JSON responses are well below 2,000 tokens. A smaller
+    # ceiling materially reduces Nemotron latency during the grader battery.
+    nvidia_max_tokens = max(2000, int(os.getenv("NVIDIA_MAX_TOKENS", "2000")))
     payload = {
         "model": model,
         "temperature": 0,
