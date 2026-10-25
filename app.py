@@ -497,7 +497,10 @@ async def call_groq(
                 async with limiter:
                     logger.info("nvidia_chunk_start index=%d packages=%d first_package=%s", index, len(chunk), chunk[0].get("packageId"))
                     try:
-                        result = await call_groq(batch_data, chunk)
+                        # Large grader batches are deadline-sensitive. Do not
+                        # spend another full retry window on a stalled chunk;
+                        # split it and recover quickly instead.
+                        result = await call_groq(batch_data, chunk, allow_timeout_retry=False)
                         logger.info("nvidia_chunk_complete index=%d packages=%d", index, len(chunk))
                         return result
                     except Exception as exc:
@@ -508,7 +511,7 @@ async def call_groq(
                         if len(chunk) > 1:
                             logger.warning("nvidia_chunk_split_retry index=%d packages=%d reason=%s", index, len(chunk), type(exc).__name__)
                             single_results = await asyncio.gather(
-                                *(call_groq(batch_data, [package], timeout_override=12.0, allow_timeout_retry=False) for package in chunk),
+                                *(call_groq(batch_data, [package], timeout_override=6.0, allow_timeout_retry=False) for package in chunk),
                                 return_exceptions=True,
                             )
                             recovered: dict[str, dict[str, Any]] = {}
@@ -580,7 +583,7 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     else:
         payload["response_format"] = {"type": "json_object"}
-    timeout_seconds = (timeout_override if timeout_override is not None else float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "20"))) if provider_name == "nvidia" else 44.0
+    timeout_seconds = (timeout_override if timeout_override is not None else float(os.getenv("NVIDIA_TIMEOUT_SECONDS", "16"))) if provider_name == "nvidia" else 44.0
     timeout = httpx.Timeout(timeout_seconds, connect=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         started = time.monotonic()
@@ -602,7 +605,7 @@ Return only a JSON object: {"decisions":[{"packageId":"exact ID", "action":"..."
                 "content": "Return the exact compact JSON schema now. Keep each rationale concise (60 to 300 characters) and include only the three decisive evidence IDs.",
             }]
             retry_started = time.monotonic()
-            retry_timeout = httpx.Timeout(min(timeout_seconds, float(os.getenv("NVIDIA_RETRY_TIMEOUT_SECONDS", "10"))), connect=8.0)
+            retry_timeout = httpx.Timeout(min(timeout_seconds, float(os.getenv("NVIDIA_RETRY_TIMEOUT_SECONDS", "6"))), connect=8.0)
             async with NVIDIA_HTTP_LIMITER:
                 async with httpx.AsyncClient(timeout=retry_timeout) as retry_client:
                     response = await retry_client.post(
