@@ -290,6 +290,30 @@ def get_part_data(message: dict[str, Any], expected_mime: str) -> dict[str, Any]
     return matching[0]["data"]
 
 
+def compact_message_for_history(message: dict[str, Any]) -> dict[str, Any]:
+    """Keep task history bounded without changing request identity or decisions.
+
+    Invoice documents can contain tens of kilobytes of source text.  They are
+    already represented in the generated proposal's evidence references, and
+    retaining every document in each task makes list/get responses grow until
+    they hit the A2A body limit.  The original message is still hashed in full
+    for idempotency; only the persisted history view is compacted.
+    """
+    compact = json.loads(canonical_json(message))
+    for part in compact.get("parts", []):
+        if not isinstance(part, dict) or part.get("mediaType") != BATCH_MIME:
+            continue
+        data = part.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("packages"), list):
+            continue
+        data["packages"] = [
+            {"packageId": package.get("packageId")}
+            for package in data["packages"]
+            if isinstance(package, dict)
+        ]
+    return compact
+
+
 def cache_get(key: str) -> dict[str, Any] | None:
     con = connect_db()
     try:
@@ -1015,7 +1039,13 @@ async def send_message(request: Request) -> Response:
             {"batchId": batch_id, "proposals": proposals},
             "Invoice action proposals",
         )
-        task = task_object(task_id, context_id, "TASK_STATE_INPUT_REQUIRED", [message], [proposal_artifact])
+        task = task_object(
+            task_id,
+            context_id,
+            "TASK_STATE_INPUT_REQUIRED",
+            [compact_message_for_history(message)],
+            [proposal_artifact],
+        )
         serialized = canonical_json(task)
         if len(serialized.encode("utf-8")) > MAX_BODY_BYTES:
             body = {"error": "TASK_TOO_LARGE"}

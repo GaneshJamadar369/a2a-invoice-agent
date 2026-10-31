@@ -150,3 +150,35 @@ def test_cancel_prevents_receipt(client, monkeypatch):
     assert not any(p["mediaType"] == agent.RECEIPTS_MIME for a in canceled.json()["artifacts"] for p in a["parts"])
     again = client.post(f"/a2a/tasks/{task['id']}:cancel", headers=headers(), content="{}")
     assert again.status_code == 409
+
+
+def test_large_invoice_documents_are_compacted_in_task_history(client, monkeypatch):
+    async def mock_call(batch_data, packages):
+        return {p["packageId"]: sample_decision(p) for p in packages}
+
+    monkeypatch.setattr(agent, "call_groq", mock_call)
+    huge_documents = "source text [INV-01] [POL-02] [PAY-03] " + ("x" * 120_000)
+    batch = {
+        "batchId": "LARGE-BATCH",
+        "policyRevision": "POLICY-1",
+        "packages": [{"packageId": "LARGE-PKG", "documents": huge_documents}],
+    }
+    message = {
+        "messageId": "large-history-msg",
+        "role": "ROLE_USER",
+        "parts": [{"mediaType": agent.BATCH_MIME, "data": batch}],
+    }
+    response = client.post(
+        "/a2a/message:send",
+        headers=headers(),
+        content=json.dumps({"message": message}),
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    stored_message = task["history"][0]
+    stored_packages = stored_message["parts"][0]["data"]["packages"]
+    assert stored_packages == [{"packageId": "LARGE-PKG"}]
+    assert "documents" not in stored_packages[0]
+    listed = client.get("/a2a/tasks", headers=headers(content_type=False))
+    assert listed.status_code == 200
+    assert len(listed.content) < agent.MAX_BODY_BYTES
